@@ -72,6 +72,16 @@ class Sequenced:
 
 
 @dataclass(frozen=True, slots=True)
+class EngineState:
+    """Everything needed to rebuild an engine exactly. Immutable, so it can be kept
+    as a snapshot without copying."""
+
+    next_order_id: int
+    next_seq: int
+    books: tuple[tuple[Symbol, BookSnapshot], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _Owner:
     symbol: Symbol
     trader: TraderId
@@ -122,6 +132,23 @@ class Engine:
 
     def snapshot(self, symbol: Symbol) -> BookSnapshot:
         return self._books[symbol].snapshot()
+
+    def state(self) -> EngineState:
+        books = tuple((symbol, book.snapshot()) for symbol, book in self._books.items())
+        return EngineState(self._next_order_id, self._next_seq, books)
+
+    @classmethod
+    def from_state(cls, state: EngineState) -> Engine:
+        """Rebuild an engine on ``OrderBook``s. The owner index is derived from the
+        resting orders, so it cannot disagree with the books."""
+        engine = cls(symbol for symbol, _ in state.books)
+        for symbol, snapshot in state.books:
+            engine._books[symbol] = OrderBook.from_snapshot(snapshot)
+            for order in snapshot.bids + snapshot.asks:
+                engine._owners[order.order_id] = _Owner(symbol, order.trader)
+        engine._next_order_id = state.next_order_id
+        engine._next_seq = state.next_seq
+        return engine
 
     def resting_owner(self, order_id: OrderId) -> tuple[Symbol, TraderId] | None:
         owner = self._owners.get(order_id)

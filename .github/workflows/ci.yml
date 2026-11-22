@@ -28,3 +28,5 @@ jobs:
         run: uv run pytest --cov=dme --cov-report=term-missing
       - name: Simulate (fixed seeds, reference-checked)
         run: uv run python -m dme.sim --seeds 0:20 --steps 5000 --reference
+      - name: Simulate (fixed seeds, all faults, reference-checked)
+        run: uv run python -m dme.sim --seeds 0:20 --steps 5000 --faults all --reference
