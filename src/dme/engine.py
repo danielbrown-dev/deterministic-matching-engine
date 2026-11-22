@@ -45,6 +45,23 @@ class Book(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class SubmitOrder:
+    symbol: Symbol
+    spec: OrderSpec
+
+
+@dataclass(frozen=True, slots=True)
+class CancelOrder:
+    trader: TraderId
+    order_id: OrderId
+
+
+Command = SubmitOrder | CancelOrder
+"""Everything that can change the engine's state. Because the engine is deterministic,
+a log of commands is a complete record: replaying it reproduces every event."""
+
+
+@dataclass(frozen=True, slots=True)
 class Sequenced:
     """An event as published by the engine."""
 
@@ -73,6 +90,11 @@ class Engine:
     @property
     def symbols(self) -> tuple[Symbol, ...]:
         return tuple(self._books)
+
+    def apply(self, command: Command) -> list[Sequenced]:
+        if isinstance(command, SubmitOrder):
+            return self.submit(command.symbol, command.spec)
+        return self.cancel(command.trader, command.order_id)
 
     def submit(self, symbol: Symbol, spec: OrderSpec) -> list[Sequenced]:
         """Assign an order ID and submit the order to the symbol's book.

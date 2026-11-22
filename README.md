@@ -4,8 +4,8 @@ A price-time priority matching engine whose correctness is checked by a determin
 simulation harness: every run is a pure function of a seed, so any failure found among
 millions of simulated orders replays exactly.
 
-> Work in progress. Done: the order book, the multi-symbol engine, and their test
-> oracles. Next: the simulation harness, then injected network faults and crashes.
+> Work in progress. Done: the order book, the multi-symbol engine, their test oracles,
+> and the deterministic simulator. Next: injected network faults and crash recovery.
 
 ## Matching rules
 
@@ -31,6 +31,32 @@ event with a global sequence number, so its whole output is one totally ordered 
 Only an order's owner can cancel it, and a rejected cancel looks the same whether the
 order never existed or belongs to someone else, so cancels cannot probe other traders'
 orders.
+
+## Deterministic simulation
+
+```sh
+python -m dme.sim --seed 7 --steps 100000
+python -m dme.sim --seeds 0:100 --steps 5000 --reference
+```
+
+A simulation is a pure function of its seed. Market makers, random traders and takers
+wake on a simulated clock (no wall-clock reads anywhere), send orders and cancels, and
+learn what happened only from the engine's events. Each component draws from its own
+seeded random stream. After every command the checker verifies every invariant below.
+
+If anything fails, the report names the seed and step and prints the exact command that
+reproduces it, plus the last 20 commands. This is a real report, from a bug planted
+in a test (the engine forgetting owners of orders removed by self-trade prevention):
+
+```
+seed=0 failed at step 3100 (t=69583us): InvariantViolation: owner index keeps non-resting order 1160
+reproduce with: python -m dme.sim --seed 0 --steps 3101
+```
+
+Every command and event feeds a SHA-256 digest of the run. The same seed must give the
+same digest in any process; a test checks this across different `PYTHONHASHSEED`
+values, which catches any accidental dependence on Python's salted string hashing.
+CI simulates fixed seeds on every change; a nightly job runs 100 fresh seeds.
 
 ## How correctness is checked
 

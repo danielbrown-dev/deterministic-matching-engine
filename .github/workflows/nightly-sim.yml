@@ -1,0 +1,36 @@
+name: Nightly simulation
+
+# Fresh seeds every night. Each run's seeds are derived from the run number, so
+# any failure in the log comes with a command that reproduces it exactly.
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of seeds"
+        default: "100"
+      steps:
+        description: "Steps per seed"
+        default: "20000"
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: uv sync
+      - name: Simulate
+        env:
+          SEEDS: ${{ inputs.seeds || '100' }}
+          STEPS: ${{ inputs.steps || '20000' }}
+        run: |
+          start=$(( ${{ github.run_number }} * 1000000 ))
+          echo "Seeds ${start}:$(( start + SEEDS )), ${STEPS} steps each"
+          uv run python -m dme.sim --seeds "${start}:$(( start + SEEDS ))" --steps "${STEPS}"

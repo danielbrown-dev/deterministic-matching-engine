@@ -16,15 +16,15 @@ from dme.core import (
     OrderId,
     OrderSpec,
     OrderType,
-    RestingOrder,
     SelfTradePrevention,
     Side,
     Symbol,
     TraderId,
 )
-from dme.engine import Engine, Sequenced
-from dme.events import CancelRejected, Event, Trade
+from dme.engine import CancelOrder, Sequenced, SubmitOrder
+from dme.events import Event
 from dme.reference import ReferenceBook
+from dme.sim.checker import EngineChecker
 
 
 @dataclass(frozen=True)
@@ -71,76 +71,19 @@ class BookPair:
 
 
 class EnginePair:
-    """An engine on real books and an engine on reference books, in lockstep."""
+    """An engine on real books, checked after every command against an engine on
+    reference books and every other invariant (see ``dme.sim.checker``)."""
 
     def __init__(self, symbols: list[Symbol]) -> None:
-        self.symbols = symbols
-        self.books: list[OrderBook] = []
-
-        def make_book() -> OrderBook:
-            book = OrderBook()
-            self.books.append(book)
-            return book
-
-        self.engine = Engine(symbols, make_book)
-        self.reference = Engine(symbols, ReferenceBook)
-        self.audit = Audit()
-        self.last_seq = 0
+        self.checker = EngineChecker(symbols, reference=True)
+        self.engine = self.checker.engine
+        self.audit = self.checker.audit
 
     def submit(self, symbol: Symbol, spec: OrderSpec) -> list[Sequenced]:
-        actual = self.engine.submit(symbol, spec)
-        expected = self.reference.submit(symbol, spec)
-        self._compare(f"submit {symbol} {spec}", actual, expected)
-        self.audit.submitted([s.event for s in actual])
-        self._check(f"submit {symbol} {spec}", actual)
-        return actual
+        return self.checker.apply(SubmitOrder(symbol, spec))
 
     def cancel(self, trader: TraderId, order_id: OrderId) -> list[Sequenced]:
-        actual = self.engine.cancel(trader, order_id)
-        expected = self.reference.cancel(trader, order_id)
-        self._compare(f"cancel {order_id} by {trader}", actual, expected)
-        self.audit.cancel_requested(order_id, trader, [s.event for s in actual])
-        self._check(f"cancel {order_id} by {trader}", actual)
-        return actual
-
-    def _compare(self, what: str, actual: list[Sequenced], expected: list[Sequenced]) -> None:
-        assert actual == expected, f"{what}: engine emitted {actual}, reference {expected}"
-        seqs = [s.seq for s in actual]
-        assert seqs == list(range(self.last_seq + 1, self.last_seq + 1 + len(seqs))), (
-            f"{what}: sequence numbers not contiguous: {seqs} after {self.last_seq}"
-        )
-        self.last_seq += len(seqs)
-        assert len({s.symbol for s in actual}) <= 1, f"{what}: events span several symbols"
-
-    def _check(self, what: str, published: list[Sequenced]) -> None:
-        resting = self.audit.resting()
-        for s in published:
-            if isinstance(s.event, CancelRejected):
-                # Must not reveal which symbol an order (or someone else's order) is on.
-                assert s.symbol is None, f"{what}: rejected cancel names a symbol"
-            # Every order this command touched and that is no longer resting must be
-            # gone from the engine's owner index, or it leaks.
-            for order_id in _order_ids(s.event):
-                if order_id not in resting:
-                    owner = self.engine.resting_owner(order_id)
-                    assert owner is None, f"{what}: stale owner for order {order_id}"
-
-        on_books: dict[OrderId, RestingOrder] = {}
-        for book in self.books:
-            book.check_invariants()
-        for symbol in self.symbols:
-            snapshot = self.engine.snapshot(symbol)
-            assert snapshot == self.reference.snapshot(symbol), f"{what}: {symbol} diverged"
-            for order in snapshot.bids + snapshot.asks:
-                on_books[order.order_id] = order
-                assert self.engine.resting_owner(order.order_id) == (symbol, order.trader)
-        assert on_books == resting, f"{what}: books disagree with the audit"
-
-
-def _order_ids(event: Event) -> tuple[OrderId, ...]:
-    if isinstance(event, Trade):
-        return (event.maker_id, event.taker_id)
-    return (event.order_id,)
+        return self.checker.apply(CancelOrder(trader, order_id))
 
 
 def random_spec(rng: random.Random, traders: int = 3) -> OrderSpec:
