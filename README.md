@@ -4,31 +4,46 @@ A price-time priority matching engine whose correctness is checked by a determin
 simulation harness: every run is a pure function of a seed, so any failure found among
 millions of simulated orders replays exactly.
 
-> Work in progress. Done: the single-instrument order book and its test oracles.
-> Next: a multi-instrument engine, then the simulation harness with injected faults.
+> Work in progress. Done: the order book, the multi-symbol engine, and their test
+> oracles. Next: the simulation harness, then injected network faults and crashes.
 
 ## Matching rules
 
-- **Limit orders** match against the opposite side while prices cross, then any
-  remainder rests on the book.
+- **Order types**: *limit* orders rest any unfilled remainder on the book;
+  *immediate-or-cancel (IOC)* orders match up to their limit and expire the rest;
+  *market* orders match at any price and expire the rest.
 - **Price-time priority**: better price first; at the same price, earlier orders first.
 - **Trades execute at the resting (maker) order's price**, so an aggressive order gets
   any price improvement.
 - **Prices and quantities are integers** (ticks and lots). No floats, so results are
   exact and reproducible.
+- **Self-trade prevention**: an order never trades with a resting order from the same
+  trader. The incoming order chooses what happens: cancel the resting order and keep
+  matching (the default, as on CME Globex), expire the incoming order, or both.
 - Every command returns the full list of events it caused (`Accepted`, `Trade`,
-  `Rested`, `Rejected`, `Cancelled`, `CancelRejected`).
+  `Rested`, `Expired`, `Rejected`, `Cancelled`, `CancelRejected`).
+
+## Engine
+
+`Engine` runs one book per symbol behind a single entry point. It assigns order IDs
+from one counter, so they are unique across symbols and never reused, and stamps every
+event with a global sequence number, so its whole output is one totally ordered stream.
+Only an order's owner can cancel it, and a rejected cancel looks the same whether the
+order never existed or belongs to someone else, so cancels cannot probe other traders'
+orders.
 
 ## How correctness is checked
 
 | Oracle | What it catches |
 | --- | --- |
 | `ReferenceBook` | A deliberately naive matcher that scans a flat list. The real book must emit identical events and snapshots for every input. |
-| `Audit` | Rules on the event stream that hold for any correct book: quantity is conserved, trades only hit resting orders at their price and within the taker's limit, cancels remove exactly what rested. |
+| `Audit` | Rules on the event stream that hold for any correct book: quantity is conserved, trades only hit resting orders at their price and within the taker's limit, no trader ever trades with itself, self-trade prevention cancels exactly what the mode says, only limit orders rest, only owners can cancel. |
 | `OrderBook.check_invariants` | Internal consistency: sorted levels, linked lists, cached totals, ID index, book never crossed. |
 
-These run after every command in a seeded random test (200 seeds × 300 commands)
-and a Hypothesis stateful test that shrinks any failure to a minimal command sequence.
+These run after every command in seeded random tests (200 seeds × 300 commands, for
+the book and for the engine) and Hypothesis stateful tests that shrink any failure to a
+minimal command sequence. The engine is also checked for contiguous sequence numbers
+and an owner index that matches the books exactly.
 `tests/test_checkers.py` corrupts state on purpose to prove each oracle actually fires.
 
 ## Data structures
