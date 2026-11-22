@@ -62,6 +62,8 @@ class SimConfig:
     reference: bool = False
     """Also run the shadow's engine against reference books and require identical
     output. Thorough but slow: the reference model scans every resting order."""
+    planted_bug: str | None = None
+    """Name of a bug from ``dme.sim.bugs`` to plant for this run, to show it is caught."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class SimulationFailure(Exception):
     def repro_command(self) -> str:
         flags = f" --faults {self.config.faults}" if self.config.faults != "none" else ""
         flags += " --reference" if self.config.reference else ""
+        flags += f" --bug {self.config.planted_bug}" if self.config.planted_bug else ""
         return f"python -m dme.sim --seed {self.seed} --steps {self.repro_steps}{flags}"
 
     def __str__(self) -> str:
@@ -353,4 +356,10 @@ class Simulation:
 
 def run(seed: int, steps: int, config: SimConfig | None = None) -> SimResult:
     """Run one simulation. Raises ``SimulationFailure`` on any violation or crash."""
-    return Simulation(seed, config or SimConfig()).run(steps)
+    config = config or SimConfig()
+    if config.planted_bug is None:
+        return Simulation(seed, config).run(steps)
+    from dme.sim.bugs import BY_NAME, planted  # imports this module
+
+    with planted(BY_NAME[config.planted_bug]):
+        return Simulation(seed, config).run(steps)

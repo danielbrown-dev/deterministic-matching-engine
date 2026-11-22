@@ -5,17 +5,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
 
 import pytest
 
-from dme import gateway, persistence
-from dme.engine import Engine
-from dme.events import Cancelled, CancelReason
-from dme.sim import node as sim_node
 from dme.sim.__main__ import main
+from dme.sim.bugs import CATALOGUE, PlantedBug
 from dme.sim.run import SimConfig, SimulationFailure, run
-from dme.sim.session import ClientSession
 
 STEPS = 3_000
 FAULT_MODES = ["none", "net", "crash", "all"]
@@ -94,95 +89,31 @@ def test_workload_reaches_every_outcome() -> None:
     assert expected <= counts.keys(), f"missing: {expected - counts.keys()}"
 
 
-# Planted bugs. Each fixture breaks one guarantee; the simulator must catch it, and the
-# reported repro command must reproduce the identical failure.
+# Planted bugs: the simulator must catch every bug in the catalogue, and the reported
+# repro command must reproduce the identical failure.
 
 
-PlantBug = Callable[[pytest.MonkeyPatch], None]
-
-
-def owner_index_leak(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The engine forgets to drop owners of orders removed by self-trade prevention."""
-    original = Engine._track
-
-    def leaky(self: Engine, symbol: object, book: object, events: list[object]) -> None:
-        kept = [
-            e
-            for e in events
-            if not (isinstance(e, Cancelled) and e.reason is CancelReason.SELF_TRADE)
-        ]
-        original(self, symbol, book, kept)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(Engine, "_track", leaky)
-
-
-def no_deduplication(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The gateway forgets requests it has seen, so a retry is entered again."""
-    original = gateway.Exchange.handle
-
-    def forgetful(self: gateway.Exchange, request: gateway.Request) -> list[gateway.Report]:
-        if not isinstance(request, gateway.ResendRequest):
-            self._requests.pop((request.trader, request.client_order_id), None)
-        return original(self, request)
-
-    monkeypatch.setattr(gateway.Exchange, "handle", forgetful)
-
-
-def recovery_skips_last_entry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Recovery replays the log but drops its final entry."""
-    original = persistence.recover
-
-    def lossy(storage: persistence.Storage, symbols: object) -> gateway.Exchange:
-        trimmed = persistence.Storage(storage.log[:-1], storage.snapshot)
-        if storage.snapshot and storage.snapshot.log_position > len(trimmed.log):
-            trimmed.snapshot = None
-        return original(trimmed, symbols)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(sim_node, "recover", lossy)
-
-
-def client_skips_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The client processes a duplicated report a second time."""
-    original = ClientSession.receive
-
-    def gullible(self: ClientSession, report: gateway.Report) -> None:
-        if report.seq < self.next_expected:
-            self._deliver(report)
-            return
-        original(self, report)
-
-    monkeypatch.setattr(ClientSession, "receive", gullible)
-
-
-PLANTED_BUGS: list[tuple[PlantBug, str, str]] = [
-    (owner_index_leak, "none", "owner index"),
-    (no_deduplication, "net", "accepted twice"),
-    (recovery_skips_last_entry, "crash", "recovered state differs"),
-    (client_skips_dedup, "net", "expected report #"),
-]
-
-
-@pytest.fixture(params=PLANTED_BUGS, ids=lambda p: p[0].__name__)
-def planted(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[tuple[str, str]]:
-    plant, faults, message = request.param
-    plant(monkeypatch)
-    yield faults, message
-
-
-def test_planted_bug_is_caught_and_reproducible(planted: tuple[str, str]) -> None:
-    faults, message = planted
+@pytest.mark.parametrize("bug", CATALOGUE, ids=lambda bug: bug.name)
+def test_planted_bug_is_caught_and_reproducible(bug: PlantedBug) -> None:
+    bugged = config(bug.faults, planted_bug=bug.name)
     with pytest.raises(SimulationFailure) as first:
-        run(seed=0, steps=50_000, config=config(faults))
+        run(seed=0, steps=50_000, config=bugged)
     failure = first.value
-    assert message in str(failure.cause)
-    assert f"--seed 0 --steps {failure.repro_steps}" in failure.repro_command
+    assert bug.expect in str(failure.cause)
+    assert f"--steps {failure.repro_steps}" in failure.repro_command
+    assert f"--bug {bug.name}" in failure.repro_command
 
     with pytest.raises(SimulationFailure) as again:
-        run(seed=0, steps=failure.repro_steps, config=config(faults))
+        run(seed=0, steps=failure.repro_steps, config=bugged)
     assert again.value.step == failure.step
     assert str(again.value.cause) == str(failure.cause)
+
+
+def test_planted_bugs_are_removed_afterwards() -> None:
+    for bug in CATALOGUE:
+        with pytest.raises(SimulationFailure):
+            run(seed=0, steps=50_000, config=config(bug.faults, planted_bug=bug.name))
+    run(seed=0, steps=STEPS, config=config("all"))  # passes again
 
 
 def test_cli_reports_passing_seeds(capsys: pytest.CaptureFixture[str]) -> None:
@@ -191,12 +122,17 @@ def test_cli_reports_passing_seeds(capsys: pytest.CaptureFixture[str]) -> None:
     assert "seed=0 " in out and "seed=1 " in out and "2 seeds passed" in out
 
 
-def test_cli_reports_failure_with_repro_command(
-    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    no_deduplication(monkeypatch)
-    assert main(["--seed", "0", "--steps", "50000", "--faults", "net"]) == 1
+def test_cli_reports_failure_with_repro_command(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--seed", "0", "--steps", "50000", "--bug", "no-dedup"]) == 1
     err = capsys.readouterr().err
     assert "reproduce with: python -m dme.sim --seed 0 --steps" in err
-    assert "--faults net" in err
+    assert "--faults net --bug no-dedup" in err
     assert "requests logged" in err
+
+
+def test_cli_bug_demo_catches_everything(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--bugs"]) == 0
+    out = capsys.readouterr().out
+    assert "MISSED" not in out
+    for bug in CATALOGUE:
+        assert bug.name in out
