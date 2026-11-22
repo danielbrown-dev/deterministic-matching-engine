@@ -17,9 +17,16 @@ practice; it is the one trade-off to revisit if benchmarks say otherwise.
 A dict from order ID to its list node gives O(1) cancel lookup.
 
 Complexity, with L price levels on a side and F fills produced:
-  * submit: O(F + log L) to match; plus O(L) if it creates a new level
+  * submit: O(F) to match, where F counts fills and self-trade cancels;
+    plus O(L) if it creates a new level
   * cancel: O(1); plus O(L) if it empties a level that is not the best
   * best bid / best ask: O(1)
+
+Self-trade prevention
+---------------------
+When the incoming order reaches a resting order from the same trader, the incoming
+order's ``SelfTradePrevention`` setting decides which side is cancelled. Orders
+ahead of the conflict at better prices, or earlier at the same price, still trade.
 
 Determinism
 -----------
@@ -32,13 +39,28 @@ from __future__ import annotations
 import bisect
 from collections.abc import Iterator
 
-from dme.core import BookSnapshot, InvariantViolation, OrderId, Price, Qty, RestingOrder, Side
+from dme.core import (
+    BookSnapshot,
+    InvariantViolation,
+    OrderId,
+    OrderSpec,
+    OrderType,
+    Price,
+    Qty,
+    RestingOrder,
+    SelfTradePrevention,
+    Side,
+    TraderId,
+)
 from dme.events import (
     Accepted,
     Cancelled,
+    CancelReason,
     CancelRejected,
     CancelRejectReason,
     Event,
+    Expired,
+    ExpireReason,
     Rejected,
     RejectReason,
     Rested,
@@ -51,10 +73,13 @@ __all__ = ["InvariantViolation", "OrderBook"]
 class _Order:
     """A resting order: a node in its price level's linked list."""
 
-    __slots__ = ("level", "next", "order_id", "prev", "qty", "side")
+    __slots__ = ("level", "next", "order_id", "prev", "qty", "side", "trader")
 
-    def __init__(self, order_id: OrderId, side: Side, qty: Qty, level: _Level) -> None:
+    def __init__(
+        self, order_id: OrderId, trader: TraderId, side: Side, qty: Qty, level: _Level
+    ) -> None:
         self.order_id = order_id
+        self.trader = trader
         self.side = side
         self.qty = qty
         self.level = level
@@ -182,21 +207,13 @@ class _HalfBook:
         return orders
 
 
-def _crosses(taker_side: Side, limit: Price, maker_price: Price) -> bool:
-    """Whether a taker with this limit price may trade at ``maker_price``."""
-    if taker_side is Side.BUY:
-        return maker_price <= limit
-    return maker_price >= limit
-
-
 class OrderBook:
     """A limit order book for one instrument.
 
     Order IDs are chosen by the caller and must be unique among resting orders.
-    Making IDs globally unique, so a cancel can never hit a reused ID, is the job
-    of the engine layer above this one.
-
-    Self-trades are allowed: the book has no notion of order ownership.
+    Making IDs globally unique, so a cancel can never hit a reused ID, is the
+    engine's job. So is checking who may cancel an order: the book cancels any
+    resting order it is asked to.
     """
 
     __slots__ = ("_asks", "_bids", "_orders")
@@ -208,39 +225,46 @@ class OrderBook:
 
     # Commands
 
-    def submit(self, order_id: OrderId, side: Side, price: Price, qty: Qty) -> list[Event]:
-        """Submit a limit order: match it against the book, then rest any remainder.
+    def submit(self, order_id: OrderId, spec: OrderSpec) -> list[Event]:
+        """Submit an order: match it against the book, then rest or expire any remainder.
 
         Validation checks run in this order and the first failure is reported:
         price, quantity, duplicate ID.
         """
-        if price <= 0:
-            return [Rejected(order_id, RejectReason.NON_POSITIVE_PRICE)]
-        if qty <= 0:
+        if not spec.has_valid_price():
+            return [Rejected(order_id, RejectReason.INVALID_PRICE)]
+        if spec.qty <= 0:
             return [Rejected(order_id, RejectReason.NON_POSITIVE_QTY)]
         if order_id in self._orders:
             return [Rejected(order_id, RejectReason.DUPLICATE_ORDER_ID)]
 
-        events: list[Event] = [Accepted(order_id, side, price, qty)]
-        remaining = self._match(order_id, side, price, qty, events)
-        if remaining > 0:
-            level = self._half(side).level_at(price)
-            order = _Order(order_id, side, remaining, level)
+        events: list[Event] = [Accepted(order_id, spec)]
+        remaining, stopped_by_stp = self._match(order_id, spec, events)
+        if remaining == 0:
+            pass
+        elif stopped_by_stp:
+            events.append(Expired(order_id, remaining, ExpireReason.SELF_TRADE))
+        elif spec.order_type is OrderType.LIMIT:
+            assert spec.price is not None  # guaranteed by has_valid_price
+            level = self._half(spec.side).level_at(spec.price)
+            order = _Order(order_id, spec.trader, spec.side, remaining, level)
             level.append(order)
             self._orders[order_id] = order
-            events.append(Rested(order_id, side, price, remaining))
+            events.append(Rested(order_id, spec.trader, spec.side, spec.price, remaining))
+        else:
+            events.append(Expired(order_id, remaining, ExpireReason.UNFILLED))
         return events
 
     def cancel(self, order_id: OrderId) -> list[Event]:
         """Remove a resting order from the book."""
-        order = self._orders.pop(order_id, None)
+        order = self._orders.get(order_id)
         if order is None:
             return [CancelRejected(order_id, CancelRejectReason.UNKNOWN_ORDER)]
         level = order.level
-        level.unlink(order)
+        self._remove(order)
         if level.head is None:
             self._half(order.side).remove_level(level)
-        return [Cancelled(order_id, order.qty)]
+        return [Cancelled(order_id, order.qty, CancelReason.REQUESTED)]
 
     # Queries
 
@@ -289,34 +313,50 @@ class OrderBook:
     def _half(self, side: Side) -> _HalfBook:
         return self._bids if side is Side.BUY else self._asks
 
-    def _match(
-        self, taker_id: OrderId, side: Side, limit: Price, qty: Qty, events: list[Event]
-    ) -> Qty:
-        """Fill the taker against the opposite side. Returns the unfilled quantity."""
-        opposite = self._half(side.opposite)
-        remaining = qty
-        while remaining > 0:
+    def _remove(self, order: _Order) -> None:
+        """Take a resting order off its level and out of the index. Leaves the level,
+        even if now empty, for the caller to remove."""
+        order.level.unlink(order)
+        del self._orders[order.order_id]
+
+    def _match(self, taker_id: OrderId, spec: OrderSpec, events: list[Event]) -> tuple[Qty, bool]:
+        """Fill the taker against the opposite side.
+
+        Returns the unfilled quantity, and whether self-trade prevention stopped the
+        taker (in which case the remainder must expire rather than rest).
+        """
+        opposite = self._half(spec.side.opposite)
+        remaining = spec.qty
+        stopped = False
+        while remaining > 0 and not stopped:
             level = opposite.best()
-            if level is None or not _crosses(side, limit, level.price):
+            if level is None or not spec.accepts(level.price):
                 break
             while remaining > 0 and (maker := level.head) is not None:
+                if maker.trader == spec.trader:
+                    if spec.stp is not SelfTradePrevention.CANCEL_INCOMING:
+                        self._remove(maker)
+                        events.append(Cancelled(maker.order_id, maker.qty, CancelReason.SELF_TRADE))
+                    if spec.stp is not SelfTradePrevention.CANCEL_RESTING:
+                        stopped = True
+                        break
+                    continue
                 fill = min(remaining, maker.qty)
                 events.append(Trade(maker.order_id, taker_id, level.price, fill))
                 remaining -= fill
                 if fill == maker.qty:
-                    level.unlink(maker)
-                    del self._orders[maker.order_id]
+                    self._remove(maker)
                 else:
                     maker.qty -= fill
                     level.total_qty -= fill
             if level.head is None:
                 opposite.remove_level(level)
-        return remaining
+        return remaining, stopped
 
     @staticmethod
     def _resting(half: _HalfBook) -> tuple[RestingOrder, ...]:
         return tuple(
-            RestingOrder(order.order_id, order.side, level.price, order.qty)
+            RestingOrder(order.order_id, order.trader, order.side, level.price, order.qty)
             for level in half.levels()
             for order in level
         )
