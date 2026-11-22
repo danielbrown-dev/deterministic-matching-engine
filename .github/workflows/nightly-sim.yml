@@ -19,6 +19,10 @@ jobs:
   simulate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        faults: [none, net, crash, all]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -33,4 +37,5 @@ jobs:
         run: |
           start=$(( ${{ github.run_number }} * 1000000 ))
           echo "Seeds ${start}:$(( start + SEEDS )), ${STEPS} steps each"
-          uv run python -m dme.sim --seeds "${start}:$(( start + SEEDS ))" --steps "${STEPS}"
+          uv run python -m dme.sim --seeds "${start}:$(( start + SEEDS ))" --steps "${STEPS}" \
+            --faults ${{ matrix.faults }}

@@ -1,15 +1,16 @@
 """Simulated market participants.
 
-Each agent is one trader with its own random stream. When it wakes it returns the
-commands it wants to send, and it learns what happened to its orders only from the
-events the engine publishes, the same way a real client would.
+Each agent is one trader with its own random stream and its own client session.
+When it wakes it places and cancels orders through the session, naming its orders
+by client order ID, and it learns what happened only from the reports the session
+delivers, the same way a real client would.
 
-The mix is chosen to keep the engine busy in every code path:
-  * market makers keep both sides of each book populated and requote often, so
-    there is always resting liquidity and a steady stream of cancels;
-  * random traders send limit and IOC orders near the fair price with random
-    self-trade settings, cancel their own orders, occasionally probe IDs they do
-    not own, and occasionally send malformed orders;
+The mix is chosen to keep the exchange busy in every code path:
+  * market makers keep several levels on both sides of each book and requote often,
+    so there is always resting liquidity and a steady stream of cancels;
+  * random traders send mostly passive limit orders that build depth, some
+    aggressive limit and IOC orders, random self-trade settings, cancels of their
+    own orders, cancels of IDs that are not live orders, and malformed orders;
   * takers send market and aggressive IOC orders that sweep several levels.
 Few traders share each book, so self-trade prevention triggers often.
 """
@@ -20,20 +21,10 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from dme.core import (
-    InvariantViolation,
-    OrderId,
-    OrderSpec,
-    OrderType,
-    Price,
-    Qty,
-    SelfTradePrevention,
-    Side,
-    Symbol,
-    TraderId,
-)
-from dme.engine import CancelOrder, Command, Sequenced, SubmitOrder
-from dme.events import Accepted, Cancelled, Rejected, Rested, Trade
+from dme.core import OrderSpec, OrderType, Price, Qty, SelfTradePrevention, Side, Symbol, TraderId
+from dme.events import Cancelled, CancelRejected, Rested, Trade
+from dme.gateway import ClientOrderId, Report
+from dme.sim.session import ClientSession
 
 MIN_PRICE = 10
 
@@ -44,17 +35,12 @@ class Market:
     def __init__(self, symbols: tuple[Symbol, ...], initial_price: Price, rng: random.Random):
         self.symbols = symbols
         self.fair: dict[Symbol, Price] = dict.fromkeys(symbols, initial_price)
-        self.orders_issued = 0
         self._rng = rng
 
     def step(self) -> None:
         for symbol in self.symbols:
             move = self._rng.choice((-1, 0, 0, 1))
             self.fair[symbol] = max(MIN_PRICE, self.fair[symbol] + move)
-
-    def observe(self, published: list[Sequenced]) -> None:
-        if published and isinstance(published[0].event, Accepted | Rejected):
-            self.orders_issued = max(self.orders_issued, published[0].event.order_id)
 
 
 @dataclass
@@ -66,38 +52,52 @@ class LiveOrder:
 
 
 class Agent(ABC):
-    def __init__(self, trader: TraderId, rng: random.Random, market: Market) -> None:
+    def __init__(
+        self, trader: TraderId, rng: random.Random, market: Market, session: ClientSession
+    ) -> None:
         self.trader = trader
         self.rng = rng
         self.market = market
-        self.live: dict[OrderId, LiveOrder] = {}
+        self.session = session
+        self.live: dict[ClientOrderId, LiveOrder] = {}
+        """This agent's resting orders, as it knows them from reports."""
+        self._symbols: dict[ClientOrderId, Symbol] = {}
+        self._cancelling: set[ClientOrderId] = set()
 
     @abstractmethod
-    def act(self) -> list[Command]:
-        """Commands to send now."""
+    def act(self) -> None:
+        """Place and cancel orders through the session."""
 
     @abstractmethod
     def next_delay(self) -> int:
         """Simulated microseconds until this agent next wakes."""
 
-    def observe(self, published: list[Sequenced]) -> None:
-        """Track this agent's resting orders from the engine's events."""
-        for s in published:
-            event = s.event
-            if isinstance(event, Rested) and event.trader == self.trader:
-                if s.symbol is None:
-                    raise InvariantViolation(f"Rested event without a symbol: {s}")
-                self.live[event.order_id] = LiveOrder(s.symbol, event.side, event.price, event.qty)
-            elif isinstance(event, Trade) and event.maker_id in self.live:
-                order = self.live[event.maker_id]
-                order.qty -= event.qty
-                if order.qty == 0:
-                    del self.live[event.maker_id]
-            elif isinstance(event, Cancelled):
-                self.live.pop(event.order_id, None)
+    def observe(self, report: Report) -> None:
+        """Track this agent's resting orders from reports, delivered exactly once and
+        in order by the session."""
+        cid, event = report.client_order_id, report.event
+        if isinstance(event, Rested):
+            self.live[cid] = LiveOrder(self._symbols[cid], event.side, event.price, event.qty)
+        elif isinstance(event, Trade) and cid in self.live:
+            order = self.live[cid]
+            order.qty -= event.qty
+            if order.qty == 0:
+                del self.live[cid]
+                self._cancelling.discard(cid)
+        elif isinstance(event, Cancelled):
+            self.live.pop(cid, None)
+            self._cancelling.discard(cid)
+        elif isinstance(event, CancelRejected):
+            self._cancelling.discard(cid)
 
-    def _cancel(self, order_id: OrderId) -> CancelOrder:
-        return CancelOrder(self.trader, order_id)
+    def _place(self, symbol: Symbol, spec: OrderSpec) -> None:
+        cid = self.session.place(symbol, spec)
+        self._symbols[cid] = symbol
+
+    def _cancel(self, cid: ClientOrderId) -> None:
+        if cid not in self._cancelling:
+            self._cancelling.add(cid)
+            self.session.cancel(cid)
 
     def _random_side(self) -> Side:
         return self.rng.choice((Side.BUY, Side.SELL))
@@ -109,37 +109,38 @@ class MarketMaker(Agent):
 
     LEVELS = 3
 
-    def act(self) -> list[Command]:
+    def act(self) -> None:
         symbol = self.rng.choice(self.market.symbols)
-        commands: list[Command] = [
-            self._cancel(order_id) for order_id, o in self.live.items() if o.symbol == symbol
-        ]
+        for cid in sorted(c for c, o in self.live.items() if o.symbol == symbol):
+            self._cancel(cid)
         fair = self.market.fair[symbol]
         half_spread = self.rng.randint(1, 3)
         for level in range(self.LEVELS):
             offset = half_spread + 2 * level
             for side, price in ((Side.BUY, fair - offset), (Side.SELL, fair + offset)):
                 qty = self.rng.randint(5, 20)
-                spec = OrderSpec.limit(self.trader, side, max(1, price), qty)
-                commands.append(SubmitOrder(symbol, spec))
-        return commands
+                self._place(symbol, OrderSpec.limit(self.trader, side, max(1, price), qty))
 
     def next_delay(self) -> int:
         return self.rng.randint(200, 1_000)
 
 
 class RandomTrader(Agent):
-    def act(self) -> list[Command]:
+    def act(self) -> None:
         roll = self.rng.random()
         if roll < 0.15 and self.live:
-            return [self._cancel(self.rng.choice(sorted(self.live)))]
+            self._cancel(self.rng.choice(sorted(self.live)))
+            return
         if roll < 0.20:
-            # Probe an ID that is probably someone else's, or does not exist yet.
-            upper = self.market.orders_issued + 5
-            return [self._cancel(OrderId(self.rng.randint(1, upper)))]
+            # An ID that is not a live order: filled, cancelled, a cancel request's
+            # own ID, or not issued yet.
+            target = self.rng.randint(1, self.session.last_issued_id + 3)
+            self.session.cancel(ClientOrderId(target))
+            return
         symbol = self.rng.choice(self.market.symbols)
         if roll < 0.22:
-            return [SubmitOrder(symbol, self._malformed())]
+            self._place(symbol, self._malformed())
+            return
         side = self._random_side()
         # Mostly passive orders that build depth; some that cross the spread.
         distance = self.rng.randint(0, 10) if self.rng.random() < 0.8 else -self.rng.randint(1, 4)
@@ -148,7 +149,7 @@ class RandomTrader(Agent):
         order_type = OrderType.LIMIT if self.rng.random() < 0.8 else OrderType.IOC
         stp = self.rng.choice(list(SelfTradePrevention))
         spec = OrderSpec(self.trader, side, order_type, price, self.rng.randint(1, 10), stp)
-        return [SubmitOrder(symbol, spec)]
+        self._place(symbol, spec)
 
     def _malformed(self) -> OrderSpec:
         side = self._random_side()
@@ -158,6 +159,8 @@ class RandomTrader(Agent):
                 OrderSpec(self.trader, side, OrderType.LIMIT, None, 5),
                 OrderSpec(self.trader, side, OrderType.MARKET, 100, 5),
                 OrderSpec(self.trader, side, OrderType.IOC, 100, 0),
+                # Claims to be another trader: the gateway must refuse it.
+                OrderSpec(TraderId(self.trader + 1000), side, OrderType.LIMIT, 100, 5),
             ]
         )
 
@@ -168,7 +171,7 @@ class RandomTrader(Agent):
 class Taker(Agent):
     """Sends aggressive orders that sweep the book."""
 
-    def act(self) -> list[Command]:
+    def act(self) -> None:
         symbol = self.rng.choice(self.market.symbols)
         side = self._random_side()
         qty = self.rng.randint(1, 30)
@@ -180,7 +183,7 @@ class Taker(Agent):
             reach = self.rng.randint(0, 4)
             price = fair + reach if side is Side.BUY else max(1, fair - reach)
             spec = OrderSpec.ioc(self.trader, side, price, qty, stp)
-        return [SubmitOrder(symbol, spec)]
+        self._place(symbol, spec)
 
     def next_delay(self) -> int:
         return self.rng.randint(200, 3_000)

@@ -223,6 +223,21 @@ class OrderBook:
         self._asks = _HalfBook(Side.SELL)
         self._orders: dict[OrderId, _Order] = {}
 
+    @classmethod
+    def from_snapshot(cls, snapshot: BookSnapshot) -> OrderBook:
+        """Rebuild a book with exactly the given resting orders, in the given priority
+        order. Used for recovery: no matching happens and no events are emitted."""
+        book = cls()
+        for order in snapshot.bids + snapshot.asks:
+            if order.order_id in book._orders:
+                raise ValueError(f"duplicate order {order.order_id} in snapshot")
+            level = book._half(order.side).level_at(order.price)
+            node = _Order(order.order_id, order.trader, order.side, order.qty, level)
+            level.append(node)
+            book._orders[order.order_id] = node
+        book.check_invariants()
+        return book
+
     # Commands
 
     def submit(self, order_id: OrderId, spec: OrderSpec) -> list[Event]:
