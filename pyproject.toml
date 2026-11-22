@@ -1,6 +1,6 @@
 [project]
 name = "deterministic-matching-engine"
-version = "0.1.0"
+version = "1.0.0"
 description = "A price-time priority matching engine verified by deterministic simulation testing."
 readme = "README.md"
 license = "MIT"
